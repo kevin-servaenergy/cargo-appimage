@@ -57,6 +57,69 @@ fn get_app_runner_binary_path() -> Result<PathBuf> {
     }
 }
 
+fn stage_libs<P: AsRef<Path>>(
+    lib_dir_staged: P,
+    target_prefix: P,
+    target: &str,
+    name: &str,
+) -> Result<Vec<PathBuf>> {
+    let lib_dir_staged = lib_dir_staged.as_ref();
+    if !lib_dir_staged.exists() {
+        std::fs::create_dir(&lib_dir_staged).context("Could not create libs directory")?;
+    }
+    let awk = std::process::Command::new("awk")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .arg("NF == 4 {print $3}; NF == 2 {print $1}")
+        .spawn()
+        .context("Could not start awk")?;
+
+    awk.stdin
+        .context("Make sure you have awk on your system")?
+        .write_all(
+            &std::process::Command::new("ldd")
+                .arg(format!(
+                    "{}/{}/{}",
+                    target_prefix.as_ref().display(),
+                    target,
+                    name
+                ))
+                .output()
+                .with_context(|| {
+                    format!(
+                        "Failed to run ldd on {}/{}/{}",
+                        target_prefix.as_ref().display(),
+                        target,
+                        name
+                    )
+                })?
+                .stdout,
+        )?;
+
+    let mut linkedlibs = String::new();
+    awk.stdout
+        .context("Unknown error ocurred while running awk")?
+        .read_to_string(&mut linkedlibs)?;
+
+    fs_extra::dir::create(&lib_dir_staged, true).context("Failed to create libs dir")?;
+
+    let mut libs = vec![];
+    for line in linkedlibs.lines() {
+        let lib_path = lib_dir_staged.join(&line[1..]);
+        if line.starts_with('/') && !lib_path.exists() {
+            let staged_path = lib_dir_staged.join(
+                std::path::Path::new(line)
+                    .file_name()
+                    .with_context(|| format!("No filename for {}", line))?,
+            );
+            std::os::unix::fs::symlink(line, &staged_path)
+                .with_context(|| format!("Error symlinking {} to {}", line, lib_path.display()))?;
+            libs.push(staged_path);
+        }
+    }
+    Ok(libs)
+}
+
 fn main() -> Result<()> {
     let (path, meta) = get_manifest()?;
     let path = path.canonicalize().context("Could not canonicalize path")?;
@@ -87,10 +150,9 @@ fn main() -> Result<()> {
         .exec()
         .context("Failed to execute cargo metadata")?;
     let target_prefix = cargo_metadata.target_directory;
-
-    if !std::path::Path::new("./icon.png").exists() {
-        std::fs::write("./icon.png", []).context("Failed to generate icon.png")?;
-    }
+    let target_stage_dir = PathBuf::from(target_prefix.clone()).join("appimage_build");
+    fs_extra::dir::create_all(&target_stage_dir, true)
+        .with_context(|| format!("Error creating {}", target_stage_dir.display()))?;
 
     let assets;
     let target = {
@@ -171,63 +233,20 @@ fn main() -> Result<()> {
 
         fs_extra::dir::create_all(appdirpath.join("usr/bin"), true)
             .with_context(|| format!("Error creating {}", appdirpath.join("usr/bin").display()))?;
+
+        let lib_dir_staged = appdirpath.join("libs");
         if link_deps {
-            if !std::path::Path::new("libs").exists() {
-                std::fs::create_dir("libs").context("Could not create libs directory")?;
-            }
-            let awk = std::process::Command::new("awk")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .arg("NF == 4 {print $3}; NF == 2 {print $1}")
-                .spawn()
-                .context("Could not start awk")?;
-
-            awk.stdin
-                .context("Make sure you have awk on your system")?
-                .write_all(
-                    &std::process::Command::new("ldd")
-                        .arg(format!("{}/{}/{}", target_prefix, &target, &name))
-                        .output()
-                        .with_context(|| {
-                            format!(
-                                "Failed to run ldd on {}/{}/{}",
-                                target_prefix, &target, &name
-                            )
-                        })?
-                        .stdout,
-                )?;
-
-            let mut linkedlibs = String::new();
-            awk.stdout
-                .context("Unknown error ocurred while running awk")?
-                .read_to_string(&mut linkedlibs)?;
-
-            fs_extra::dir::create("libs", true).context("Failed to create libs dir")?;
-
-            for line in linkedlibs.lines() {
-                if line.starts_with('/') && !std::path::Path::new("libs").join(&line[1..]).exists()
-                {
-                    std::os::unix::fs::symlink(
-                        line,
-                        std::path::Path::new("libs").join(
-                            std::path::Path::new(line)
-                                .file_name()
-                                .with_context(|| format!("No filename for {}", line))?,
-                        ),
-                    )
-                    .with_context(|| {
-                        format!(
-                            "Error symlinking {} to {}",
-                            line,
-                            std::path::Path::new("libs").join(&line[1..]).display()
-                        )
-                    })?;
-                }
-            }
+            stage_libs(
+                &lib_dir_staged,
+                &PathBuf::from(&target_prefix),
+                &target,
+                &name,
+            )
+            .context("Could not stage libs")?;
         }
 
-        if std::path::Path::new("libs").exists() {
-            for i in std::fs::read_dir("libs").context("Could not read libs dir")? {
+        if lib_dir_staged.exists() {
+            for i in std::fs::read_dir(&lib_dir_staged).context("Could not read libs dir")? {
                 let path = &i?.path();
 
                 // Skip if it matches the exclude list.
@@ -272,7 +291,16 @@ fn main() -> Result<()> {
                 target_prefix, &target, &name
             )
         })?;
-        std::fs::copy("./icon.png", appdirpath.join("icon.png")).context("Cannot find icon.png")?;
+
+        let icon_path = std::path::Path::new("./icon.png");
+        let icon_dest_path = appdirpath.join(icon_path.file_name().unwrap());
+        if icon_path.is_file() {
+            std::fs::copy(&icon_path, &icon_dest_path)
+                .context(format!("Cannot copy {icon_path:?}"))?;
+        } else {
+            std::fs::write(&icon_dest_path, [])
+                .context(format!("Failed to generate {icon_dest_path:?}"))?;
+        }
         fs_extra::copy_items(
             &assets,
             appdirpath.as_path(),
