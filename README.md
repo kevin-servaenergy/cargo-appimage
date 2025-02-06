@@ -59,6 +59,17 @@ cargo install cargo-appimage
     ```shell
     cargo appimage --features=min
     ```
+
+    2. There are two env variables that can be used to specify the package to build.
+    - `CARGO_APPIMAGE_PACKAGE_PATH`: Path to package dir or package manifest
+    - `CARGO_APPIMAGE_PACKAGE`: Name of package. Assumes that current directory is the workspace root. Ignored if `CARGO_APPIMAGE_PACKAGE_PATH` is set.
+
+    ```shell
+
+    CARGO_APPIMAGE_PACKAGE="mypackage" cargo appimage
+
+    ```
+
 ## Docker
 Apparently this `Dockerfile` works
 ```dockerfile

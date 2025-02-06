@@ -1,13 +1,73 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use cargo_toml::Value;
 use fs_extra::dir::CopyOptions;
 use std::{
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
+const CARGO_APPIMAGE_PACKAGE_PATH: &str = "CARGO_APPIMAGE_PACKAGE_PATH";
+const CARGO_APPIMAGE_PACKAGE: &str = "CARGO_APPIMAGE_PACKAGE";
+const CARGO_FNAME: &str = "Cargo.toml";
+const APPIMAGE_RUNNER: &str = "cargo-appimage-runner";
+
+/// Return path to a package manifest and it's manifest
+fn get_manifest() -> Result<(PathBuf, cargo_toml::Manifest)> {
+    let package_path = if let Ok(env_package) = std::env::var(CARGO_APPIMAGE_PACKAGE_PATH) {
+        PathBuf::from(env_package)
+    } else {
+        let package_name = std::env::var(CARGO_APPIMAGE_PACKAGE).unwrap_or_default();
+        std::env::current_dir()
+            .context("Could not get current dir")?
+            .join(package_name)
+    };
+
+    get_manifest_from_path(package_path)
+}
+
+/// Return path to a package manifest and it's manifest from path.
+///
+/// The path can either be a directory or the path to manifest
+fn get_manifest_from_path<P: AsRef<Path>>(
+    package_path: P,
+) -> Result<(PathBuf, cargo_toml::Manifest)> {
+    let package_path = if package_path.as_ref().is_dir() {
+        package_path.as_ref().join(CARGO_FNAME)
+    } else {
+        package_path.as_ref().to_path_buf()
+    };
+    let manifest = cargo_toml::Manifest::from_path(&package_path).context(format!(
+        "Could not load manifest from path: {package_path:?}"
+    ))?;
+    Ok((package_path, manifest))
+}
+
+/// Get the app runner binary installed by Cargo.
+fn get_app_runner_binary_path() -> Result<PathBuf> {
+    let path = PathBuf::from(std::env::var("HOME").context("Could not get home path")?)
+        .join(std::env::var("CARGO_HOME").unwrap_or_else(|_| ".cargo".to_string()))
+        .join("bin")
+        .join(APPIMAGE_RUNNER);
+    if !path.is_file() {
+        eprintln!("Warning: Could not get appimage runner from install dir");
+        Err(anyhow!("Could not get appimage runner from install dir"))
+    } else {
+        Ok(path)
+    }
+}
+
 fn main() -> Result<()> {
+    let (path, meta) = get_manifest()?;
+    let path = path.canonicalize().context("Could not canonicalize path")?;
+    println!("Found manifest: {path:?}");
+    let parent = path.parent().context("Package path has no parent")?;
+    println!("Moving into package root: {parent:?}");
+    std::env::set_current_dir(parent).context("Could not chdir to package root")?;
+    let pkg = meta
+        .package
+        .context(format!("Cannot load metadata from {CARGO_FNAME}"))?;
+
     // Create and execute cargo build command.
     let mut command = Command::new("cargo");
     command.arg("build");
@@ -18,7 +78,10 @@ fn main() -> Result<()> {
         command.arg("--release");
     }
     command.args(std::env::args().skip(2));
-    command.status().context("Failed to build package")?;
+    let status = command.status().context("Failed to build package")?;
+    if !status.success() {
+        bail!("Failed to build package");
+    }
 
     let cargo_metadata = cargo_metadata::MetadataCommand::new()
         .exec()
@@ -29,22 +92,6 @@ fn main() -> Result<()> {
         std::fs::write("./icon.png", []).context("Failed to generate icon.png")?;
     }
 
-    while !Path::new("Cargo.toml").exists() {
-        if std::env::current_dir().unwrap() == Path::new("/") {
-            bail!("No Cargo.toml found in any parent dirs");
-        }
-        std::env::set_current_dir("..").context("Cannot chdir into previous directory")?;
-    }
-
-    let mut meta = cargo_toml::Manifest::<Value>::from_slice(unsafe {
-        memmap::Mmap::map(&std::fs::File::open("Cargo.toml")?)?.as_ref()
-    })
-    .context("Cannot find Cargo.toml")?;
-    meta.complete_from_path_and_workspace::<cargo_toml::Value>(Path::new("."), None)
-        .context("Could not fill in the gaps in Cargo.toml")?;
-    let pkg = meta
-        .package
-        .context("Cannot load metadata from Cargo.toml")?;
     let assets;
     let target = {
         let profile = std::env::args()
@@ -249,19 +296,11 @@ fn main() -> Result<()> {
                     appdirpath.join("cargo-appimage.desktop").display()
                     )
             })?;
-        std::fs::copy(
-            std::path::PathBuf::from(std::env::var("HOME")?)
-                .join(std::env::var("CARGO_HOME").unwrap_or_else(|_| ".cargo".to_string()))
-                .join("bin/cargo-appimage-runner"),
-            appdirpath.join("AppRun"),
-        )
-        .with_context(|| {
+        let app_runner_path = get_app_runner_binary_path()?;
+        std::fs::copy(&app_runner_path, appdirpath.join("AppRun")).with_context(|| {
             format!(
                 "Error copying {} to {}",
-                std::path::PathBuf::from(std::env::var("HOME").unwrap())
-                    .join(std::env::var("CARGO_HOME").unwrap_or_else(|_| ".cargo".to_string()))
-                    .join("bin/cargo-appimage-runner")
-                    .display(),
+                app_runner_path.display(),
                 appdirpath.join("AppRun").display()
             )
         })?;
@@ -274,7 +313,7 @@ fn main() -> Result<()> {
             .context("Unable to create output dir")?;
         Command::new("appimagetool")
             .args(bin_args)
-            .arg(&format!("{}/appimage/{}.AppImage", &target_prefix, &name))
+            .arg(format!("{}/appimage/{}.AppImage", &target_prefix, &name))
             .env("ARCH", platforms::target::TARGET_ARCH.as_str())
             .env("VERSION", pkg.version())
             .status()
