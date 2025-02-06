@@ -29,7 +29,7 @@ fn main() -> anyhow::Result<()> {
         format!(
             "XDG_DATA_DIRS={}:{}",
             parent.join("usr/share").display(),
-            std::env::var("XDG_DATA_DIRS").unwrap_or(String::new())
+            std::env::var("XDG_DATA_DIRS").unwrap_or_default()
         ),
     );
 

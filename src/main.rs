@@ -65,7 +65,7 @@ fn stage_libs<P: AsRef<Path>>(
 ) -> Result<Vec<PathBuf>> {
     let lib_dir_staged = lib_dir_staged.as_ref();
     if !lib_dir_staged.exists() {
-        std::fs::create_dir(&lib_dir_staged).context("Could not create libs directory")?;
+        std::fs::create_dir(lib_dir_staged).context("Could not create libs directory")?;
     }
     let awk = std::process::Command::new("awk")
         .stdin(Stdio::piped())
@@ -101,7 +101,7 @@ fn stage_libs<P: AsRef<Path>>(
         .context("Unknown error ocurred while running awk")?
         .read_to_string(&mut linkedlibs)?;
 
-    fs_extra::dir::create(&lib_dir_staged, true).context("Failed to create libs dir")?;
+    fs_extra::dir::create(lib_dir_staged, true).context("Failed to create libs dir")?;
 
     let mut libs = vec![];
     for line in linkedlibs.lines() {
@@ -295,7 +295,7 @@ fn main() -> Result<()> {
         let icon_path = std::path::Path::new("./icon.png");
         let icon_dest_path = appdirpath.join(icon_path.file_name().unwrap());
         if icon_path.is_file() {
-            std::fs::copy(&icon_path, &icon_dest_path)
+            std::fs::copy(icon_path, &icon_dest_path)
                 .context(format!("Cannot copy {icon_path:?}"))?;
         } else {
             std::fs::write(&icon_dest_path, [])
